@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+__MACOSX/
+
+# Static resources
+resources/fonts/
+
+# Sensitive config
+config.py
+
+# Outputs
+output/
+
+# Database
+filelist.txt
+*.db
+
+# Logs
+
+# Others
+test/
+old/
