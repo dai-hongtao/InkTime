@@ -9,9 +9,110 @@ import os
 import subprocess
 import time
 import requests
-from PIL import Image, ExifTags
+import io
+from PIL import Image, ExifTags, ImageOps
 import config as cfg
 import shutil
+
+
+# =======================
+# NAS 掉盘守护（macOS /Volumes）
+# =======================
+NAS_MOUNT_URL = str(getattr(cfg, "NAS_MOUNT_URL", "") or "").strip()
+NAS_MOUNT_POINT = Path(str(getattr(cfg, "NAS_MOUNT_POINT", "/Volumes/photo") or "/Volumes/photo")).expanduser()
+NAS_RETRY_TIMES = int(getattr(cfg, "NAS_RETRY_TIMES", 3) or 3)
+NAS_RETRY_SLEEP_SEC = float(getattr(cfg, "NAS_RETRY_SLEEP_SEC", 2.0) or 2.0)
+
+
+def _is_mount_ok() -> bool:
+    """判断 NAS 是否仍然挂载（尽量保守）。"""
+    try:
+        # /Volumes 下的网络卷一般是 mount point
+        if NAS_MOUNT_POINT and NAS_MOUNT_POINT.exists():
+            if os.path.ismount(str(NAS_MOUNT_POINT)):
+                return True
+        # 兜底：只要图片根目录可访问也算 OK
+        return IMAGE_DIR.exists()
+    except Exception:
+        return False
+
+
+def _try_remount_nas() -> bool:
+    """尝试重挂载 NAS。
+
+    只在配置了 NAS_MOUNT_URL 时执行；优先使用 macOS 的 AppleScript 挂载，
+    这样可以复用钥匙串里保存的凭据。
+    """
+    if not NAS_MOUNT_URL:
+        return False
+
+    print(f"[WARN] 检测到 NAS 可能掉盘，尝试重挂载：{NAS_MOUNT_URL}")
+
+    # 1) AppleScript（推荐）：mount volume "afp://..." / "smb://..."
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'mount volume "{NAS_MOUNT_URL}"'],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        pass
+
+    # 2) 兜底：如果你更喜欢命令行挂载，可以自行改成 mount_afp / mount_smbfs。
+
+    # 等待卷出现
+    for _ in range(10):
+        if _is_mount_ok():
+            print("[INFO] NAS 重挂载成功，继续处理。")
+            return True
+        time.sleep(0.5)
+
+    print("[WARN] NAS 重挂载失败（卷仍不可用）。")
+    return False
+
+
+def _read_bytes_with_nas_retry(path: Path) -> bytes:
+    """读文件：遇到 NAS 掉盘类错误时，尝试重挂载并重试。"""
+    last_err: Exception | None = None
+
+    # 只对照片库路径内的文件启用重挂载逻辑，避免误伤本地文件。
+    try:
+        in_photo_dir = str(path).startswith(str(IMAGE_DIR))
+    except Exception:
+        in_photo_dir = False
+
+    for attempt in range(1, max(1, NAS_RETRY_TIMES) + 1):
+        try:
+            return path.read_bytes()
+        except OSError as e:
+            last_err = e
+
+            # 不在照片库目录内，或者没有配置 NAS URL，直接抛
+            if not in_photo_dir or not NAS_MOUNT_URL:
+                raise
+
+            # 常见网络卷断连错误：57 Socket is not connected；也可能表现为 5/6 等 I/O 类错误。
+            # 这里不做过度精确匹配，先判断挂载状态；如果掉盘就尝试重挂载。
+            if not _is_mount_ok():
+                print(f"[WARN] 读文件失败（第 {attempt}/{NAS_RETRY_TIMES} 次）：{e}")
+                ok = _try_remount_nas()
+                if ok:
+                    # 重挂载后立刻重试
+                    continue
+
+            # 如果挂载看起来还 OK，但仍然读失败，按重试策略稍等再试
+            if attempt < NAS_RETRY_TIMES:
+                print(f"[WARN] 读文件失败（第 {attempt}/{NAS_RETRY_TIMES} 次），稍后重试：{e}")
+                time.sleep(max(0.1, NAS_RETRY_SLEEP_SEC))
+                continue
+
+            raise
+
+    # 理论上不会到这
+    if last_err:
+        raise last_err
+    raise OSError("读取文件失败")
 
 
 # ================== 配置区域（来自 config.py） ==================
@@ -49,6 +150,11 @@ BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
 # 请求超时时间（秒）
 TIMEOUT = float(getattr(cfg, "TIMEOUT", 600) or 600)
 
+# 发送给 VLM 之前，先把图片长边缩放到该值（像素）。
+# 0 表示不缩放。
+# 本地推理可保持较高值；云端推理建议降低（减少 token/成本）。
+VLM_MAX_LONG_EDGE = int(getattr(cfg, "VLM_MAX_LONG_EDGE", 2560) or 2560)
+
 # 中文城市数据库位置
 WORLD_CITIES_CSV = Path(str(getattr(cfg, "WORLD_CITIES_CSV", "data/world_cities_zh.csv") or "data/world_cities_zh.csv")).expanduser()
 if not WORLD_CITIES_CSV.is_absolute():
@@ -77,8 +183,53 @@ def require_exiftool() -> None:
         )
 
 def encode_image_to_b64(path: Path) -> str:
-    data = path.read_bytes()
-    return base64.b64encode(data).decode("utf-8")
+    """读取图片并（可选）缩放长边后，重新编码为 JPEG，再转 base64。
+
+    目的：
+    1) 控制输入分辨率（尤其是 200MP 这类超大图），避免推理成本/延迟暴涨；
+    2) 通过重新编码，尽量规避某些 JPEG 在 libvips 侧解码报错（如 marker 前多余字节）。
+    """
+    data = _read_bytes_with_nas_retry(path)
+
+    # 尽量用 PIL 容错打开，然后统一转成干净的 JPEG bytes
+    try:
+        img = Image.open(io.BytesIO(data))
+        # 处理 EXIF 旋转
+        try:
+            img = ImageOps.exif_transpose(img)  # type: ignore
+        except Exception:
+            pass
+
+        # 统一色彩模式：JPEG 需要 RGB
+        if img.mode in ("RGBA", "LA"):
+            # 有透明通道时，用白底合成
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # 可选缩放
+        try:
+            w, h = img.size
+            long_edge = max(w, h)
+            if VLM_MAX_LONG_EDGE and long_edge > VLM_MAX_LONG_EDGE:
+                scale = float(VLM_MAX_LONG_EDGE) / float(long_edge)
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                img = img.resize((new_w, new_h), resample=Image.LANCZOS)
+        except Exception:
+            pass
+
+        out = io.BytesIO()
+        # quality 92 在观感和体积之间比较平衡；optimize 可能更慢但通常能降体积
+        img.save(out, format="JPEG", quality=92, optimize=True)
+        clean_bytes = out.getvalue()
+        return base64.b64encode(clean_bytes).decode("utf-8")
+
+    except Exception:
+        # 兜底：如果 PIL 也打不开，就退回原始 bytes（让上游报错更直观）
+        return base64.b64encode(data).decode("utf-8")
 
 
 def ensure_table(conn: sqlite3.Connection) -> None:
@@ -190,25 +341,28 @@ def generate_side_caption(image_path: Path) -> str | None:
         "你的目标不是描述画面，而是为画面补上一点“画外之意”。\n\n"
 
         "创作原则：\n"
-        "1. 只基于图片中能确定的信息进行联想，不要虚构时间、人物关系、事件背景。\n"
-        "2. 文案应自然、有趣，带一点幽默或者诗意，但请避免煽情、鸡汤。\n"
-        "3. 不要复述画面内容本身，而是写“看完画面后，心里多出来的一句话”。\n"
-        "4. 可以偏向以下风格之一：\n"
+        "1. 避免使用以下词语：世界、梦、时光、岁月、温柔、治愈、刚刚好、悄悄、慢慢 等（但不是绝对禁止）。\n"
+        "2. 严禁使用如下句式：……里……着整个世界；……里……着整个夏天；……得像……（简单的比喻）; ……比……还……； ……得比……更……。\n"
+        "3. 只基于图片中能确定的信息进行联想，不要虚构时间、人物关系、事件背景。\n"
+        "4. 文案应自然、有趣，带一点幽默或者诗意，但请避免煽情、鸡汤。\n"
+        "5. 不要复述画面内容本身，而是写“看完画面后，心里多出来的一句话”。\n"
+        "6. 可以偏向以下风格之一：\n"
         "   - 日常中的微妙情绪\n"
         "   - 轻微自嘲或冷幽默\n"
         "   - 对时间、记忆、瞬间的含蓄感受\n"
         "   - 看似平淡但有余味的一句判断\n"
-        "5. 避免小学生作文式的、套路式的模板化表达：\n"
-        "   - 避免使用以下词语：世界、梦、时光、岁月、温柔、治愈、刚刚好、悄悄、慢慢 等（但不是绝对禁止）。\n"
-        "   - 禁止使用如下句式：XX里X着整个世界；XX里X着整个夏天；XX得像XX（简单的比喻）; XX比XX还XX； XX得比XX更XX。\n"
+        "7. 避免小学生作文式的、套路式的模板化表达\n"
+
         "格式要求：\n"
         "1. 只输出一句中文短句，不要换行，不要引号，不要任何解释。\n"
         "2. 建议长度 8～24 个汉字，最多不超过 30 个汉字。\n"
         "3. 不要出现“这张照片”“这一刻”“那天”等指代照片本身的词。\n"
     )
     user_prompt = "请基于这张照片，生成一句符合规则的中文文案。"
-
-    img_b64 = encode_image_to_b64(image_path)
+    try:
+        img_b64 = encode_image_to_b64(image_path)
+    except Exception:
+        return None
 
     headers = {"Content-Type": "application/json"}
     if API_KEY:
@@ -532,7 +686,10 @@ def get_city_resolver():
 
 
 def call_vlm(image_path: Path) -> dict:
-    img_b64 = encode_image_to_b64(image_path)
+    try:
+        img_b64 = encode_image_to_b64(image_path)
+    except Exception as e:
+        raise RuntimeError(f"读取图片失败（可能 NAS 掉盘）：{e}")
 
     exif_info = read_exif(image_path)
     exif_json = json.dumps(exif_info, ensure_ascii=False, default=str)
@@ -658,8 +815,13 @@ def main():
     city_resolver = get_city_resolver()
 
     cur_test = conn.cursor()
-    counted = cur_test.execute("SELECT COUNT(*) FROM photo_scores").fetchone()[0]
-    print(f"[INFO] 数据库中已有 {counted} 张已分析照片。")
+    # 只统计当前 IMAGE_DIR 下的已分析照片，避免数据库里其它路径/历史残留影响进度计算
+    image_dir_prefix = str(IMAGE_DIR)
+    counted = cur_test.execute(
+        "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
+        (image_dir_prefix + "%",),
+    ).fetchone()[0]
+    print(f"[INFO] 数据库中已有 {counted} 张已分析照片（仅统计当前目录）。")
 
     target_paths = filter_unscored(conn, imgs)
     if not target_paths:
@@ -670,9 +832,11 @@ def main():
     if BATCH_LIMIT is not None:
         target_paths = target_paths[:BATCH_LIMIT]
 
-    total = len(imgs)
+    # 进度条口径：以“本次启动时的快照”为准。
+    # total = 已分析(当前目录) + 本次待处理（filter_unscored 产生的目标集合）
     already_done = counted
-    print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（总数 {total}，已分析 {already_done}）。")
+    total = already_done + len(target_paths)
+    print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
 
     cur = conn.cursor()
     start_time = time.time()
@@ -809,9 +973,17 @@ def main():
         total_cost = t_photo_end - t_photo_start
         # pretty timing summary
 
-        # 进度条与预估时间
+        # 进度条与预估时间（以本次启动时的快照为准，不受运行中新增照片影响）
         processed_now = already_done + idx
-        progress = processed_now / total if total > 0 else 0.0
+
+        denom = total if total > 0 else 1
+        progress = processed_now / denom
+        # 夹紧，确保不会超过 100%
+        if progress < 0:
+            progress = 0.0
+        if progress > 1:
+            progress = 1.0
+
         bar_width = 30
         filled = int(bar_width * progress)
         bar = "█" * filled + "░" * (bar_width - filled)
