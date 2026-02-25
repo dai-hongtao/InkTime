@@ -923,10 +923,27 @@ def call_vlm(image_path: Path) -> dict:
 
 
 def main():
-    filelist_path = ROOT_DIR / "filelist.txt"
+    import argparse
+    parser = argparse.ArgumentParser(description="分析照片并生成评分")
+    parser.add_argument("--cache", action="store_true",
+                        help="启用文件列表缓存：首次扫描后写入缓存，后续直接读取")
+    args = parser.parse_args()
 
-    print("[INFO] 正在扫描图片目录……")
-    imgs = list_images()
+    filelist_path = ROOT_DIR / "filelist.txt"
+    cache_path = ROOT_DIR / ".filelist_cache.txt"
+
+    if args.cache and cache_path.exists():
+        print(f"[INFO] 读取缓存文件列表：{cache_path}")
+        cached = cache_path.read_text(encoding="utf-8").strip().splitlines()
+        imgs = [Path(p) for p in cached if p.strip()]
+        print(f"[INFO] 从缓存加载 {len(imgs)} 个文件。")
+    else:
+        print("[INFO] 正在扫描图片目录……")
+        imgs = list_images()
+        if args.cache:
+            cache_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
+            print(f"[INFO] 已写入缓存文件：{cache_path}")
+
     filelist_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
     print(f"[INFO] 已更新文件列表 filelist.txt，共 {len(imgs)} 个文件。")
     if not imgs:
