@@ -817,12 +817,12 @@ def _post_with_channel_fallback(
                 last_error = str(e)
                 continue
             with _channel_lock:
-                _channel_index = idx
+                _channel_index = 0
             return parsed
 
         # 无 parser，直接返回 response
         with _channel_lock:
-            _channel_index = idx
+            _channel_index = 0
         return resp
 
     # 所有渠道都失败了
