@@ -180,6 +180,9 @@ HOME_LON = float(getattr(cfg, "HOME_LON", 114.057865) or 114.057865)
 HOME_RADIUS_KM = float(getattr(cfg, "HOME_RADIUS_KM", 60.0) or 60.0)
 # ==================================================
 
+# 调试模式（由 --debug 命令行参数控制）
+DEBUG: bool = False
+
 # exiftool 是否可用：缺失时只降级 GPS/部分 EXIF，不中断流程
 EXIFTOOL_AVAILABLE = False
 
@@ -806,6 +809,23 @@ def _post_with_channel_fallback(
         if not resp.ok:
             print(f"[WARN] 渠道 {ch_label} 返回 HTTP {resp.status_code}，切换到下一个渠道")
             last_error = f"HTTP {resp.status_code}"
+            if DEBUG:
+                try:
+                    _body_str = json.dumps(body, ensure_ascii=False)
+                    # base64 内容太长，截断后打印
+                    import re as _re
+                    _body_debug = _re.sub(
+                        r'("data:[^;]+;base64,)([A-Za-z0-9+/=]{200})[A-Za-z0-9+/=]+',
+                        r'\1\2…<truncated>',
+                        _body_str,
+                    )
+                    print(f"[DEBUG] 请求体（base64 已截断）:\n{_body_debug}")
+                except Exception:
+                    pass
+                try:
+                    print(f"[DEBUG] 响应体:\n{resp.text}")
+                except Exception:
+                    pass
             continue
 
         # 2xx 成功，如果有 parser 则尝试解析
@@ -1095,7 +1115,14 @@ def main():
                         help="启用文件列表缓存：首次扫描后写入缓存，后续直接读取")
     parser.add_argument("-j", "--concurrency", type=int, default=1,
                         help="并发处理线程数（默认 1，即串行处理）")
+    parser.add_argument("--debug", action="store_true",
+                        help="调试模式：请求失败时打印请求体和响应体")
     args = parser.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
+    if DEBUG:
+        print("[INFO] 调试模式已启用")
 
     concurrency = max(1, args.concurrency)
     if concurrency > 1:
