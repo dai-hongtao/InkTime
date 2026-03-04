@@ -4,10 +4,21 @@ IMAGE_DIR = "./test"
 # 数据库路径（建议保持默认）
 DB_PATH = "./photos.db"
 
-# VLM 模型接口（如 LM Studio）
-API_URL = "http://127.0.0.1:1234/v1/chat/completions"
-MODEL_NAME = "qwen3-vl-32b-instruct"
-API_KEY = ""
+# VLM 渠道列表（按优先级从高到低排列）
+# 当某个渠道返回 429 时，自动尝试下一个渠道
+API_CHANNELS = [
+    {
+        "api_url":    "http://127.0.0.1:1234/v1/chat/completions",
+        "api_key":    "",
+        "model_name": "qwen3-vl-32b-instruct",
+    },
+    # 可以添加更多渠道，例如：
+    # {
+    #     "api_url":    "https://other-provider.com/v1/chat/completions",
+    #     "api_key":    "sk-xxxxxxxx",
+    #     "model_name": "qwen-vl-plus",
+    # },
+]
 
 # 每次最多处理多少张的图片
 BATCH_LIMIT = None

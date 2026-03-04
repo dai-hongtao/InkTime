@@ -8,9 +8,13 @@ import sqlite3
 import os
 import subprocess
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import io
 from PIL import Image, ExifTags, ImageOps
+import pillow_heif
+pillow_heif.register_heif_opener()
 import config as cfg
 import shutil
 
@@ -129,20 +133,29 @@ DB_PATH = Path(str(getattr(cfg, "DB_PATH", "photos.db") or "photos.db")).expandu
 if not DB_PATH.is_absolute():
     DB_PATH = (ROOT_DIR / DB_PATH).resolve()
 
-# LM Studio/OpenAI 兼容接口（仍允许用环境变量覆盖）
-API_URL = str(
-    getattr(cfg, "API_URL", None)
-    or os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-)
+# ---- 渠道列表（支持 429 自动切换） ----
+_raw_channels = getattr(cfg, "API_CHANNELS", None) or []
+if not _raw_channels:
+    # 向后兼容：从旧的单变量配置构建单渠道
+    _compat_url = str(
+        getattr(cfg, "API_URL", None)
+        or os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
+    )
+    _compat_model = str(
+        getattr(cfg, "MODEL_NAME", None)
+        or os.environ.get("LMSTUDIO_MODEL", "qwen3-vl-32b-instruct")
+    )
+    _compat_key = str(
+        getattr(cfg, "API_KEY", None)
+        or os.environ.get("LMSTUDIO_API_KEY", "")
+    )
+    _raw_channels = [
+        {"api_url": _compat_url, "model_name": _compat_model, "api_key": _compat_key}
+    ]
 
-# 模型名称（仍允许用环境变量覆盖）
-MODEL_NAME = str(
-    getattr(cfg, "MODEL_NAME", None)
-    or os.environ.get("LMSTUDIO_MODEL", "qwen3-vl-32b-instruct")
-)
-
-# API KEY（仍允许用环境变量覆盖）
-API_KEY = str(getattr(cfg, "API_KEY", None) or os.environ.get("LMSTUDIO_API_KEY", ""))
+API_CHANNELS: list[dict] = list(_raw_channels)
+_channel_index: int = 0  # 记住上次成功的渠道位置
+_channel_lock = threading.Lock()  # 保护 _channel_index 的并发访问
 
 # 每次处理多少张；None 为不限制
 BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
@@ -166,6 +179,9 @@ HOME_LAT = float(getattr(cfg, "HOME_LAT", 22.543096) or 22.543096)
 HOME_LON = float(getattr(cfg, "HOME_LON", 114.057865) or 114.057865)
 HOME_RADIUS_KM = float(getattr(cfg, "HOME_RADIUS_KM", 60.0) or 60.0)
 # ==================================================
+
+# 调试模式（由 --debug 命令行参数控制）
+DEBUG: bool = False
 
 # exiftool 是否可用：缺失时只降级 GPS/部分 EXIF，不中断流程
 EXIFTOOL_AVAILABLE = False
@@ -364,33 +380,35 @@ def generate_side_caption(image_path: Path) -> str | None:
     except Exception:
         return None
 
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                    },
-                ],
-            },
-        ],
-        "temperature": 0.7,
-        "max_tokens": 64,
-        "top_p": 0.9,
-        "stream": False,
-    }
+    def _build(ch):
+        headers = {"Content-Type": "application/json"}
+        key = ch.get("api_key", "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        body = {
+            "model": ch["model_name"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.7,
+            "max_tokens": 64,
+            "top_p": 0.9,
+            "stream": False,
+        }
+        return ch["api_url"], headers, body
 
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=min(120, TIMEOUT))
+        resp = _post_with_channel_fallback(_build, timeout=min(120, TIMEOUT))
     except Exception:
         return None
 
@@ -411,7 +429,7 @@ def generate_side_caption(image_path: Path) -> str | None:
 
 
 def list_images(limit: int | None = None) -> list[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic"}
     files = []
     print("[INFO] 正在递归扫描图片目录，请稍候……")
     scanned = 0
@@ -505,7 +523,18 @@ def read_exif(path: Path) -> dict:
                 info["orientation"] = "square"
         except Exception:
             pass
-        exif_raw = img._getexif() or {}
+
+        # 使用公共 API getexif()，兼容 JPEG / PNG / WebP / HEIC 等格式
+        # （_getexif() 是 JPEG 专有的私有方法，HEIC 不支持）
+        exif_obj = img.getexif()
+        if not exif_obj:
+            # 兜底：尝试 _getexif()（旧版 Pillow 或特殊格式）
+            try:
+                exif_raw = img._getexif() or {}
+            except (AttributeError, Exception):
+                exif_raw = {}
+        else:
+            exif_raw = dict(exif_obj)
     except Exception:
         return info
 
@@ -523,28 +552,75 @@ def read_exif(path: Path) -> dict:
     info["f_number"] = exif.get("FNumber")
     info["focal_length"] = exif.get("FocalLength")
 
-    gps_info = exif.get("GPSInfo")
+    # 如果主 EXIF 中缺少 DateTimeOriginal，尝试从 ExifIFD 子 IFD 获取
+    if not info.get("datetime"):
+        try:
+            exif_ifd = exif_obj.get_ifd(ExifTags.IFD.Exif)
+            if exif_ifd:
+                dt = exif_ifd.get(0x9003)  # DateTimeOriginal
+                if dt:
+                    info["datetime"] = dt
+                if not info.get("iso"):
+                    info["iso"] = exif_ifd.get(0x8827)  # ISOSpeedRatings
+                if not info.get("exposure_time"):
+                    info["exposure_time"] = exif_ifd.get(0x829A)  # ExposureTime
+                if not info.get("f_number"):
+                    info["f_number"] = exif_ifd.get(0x829D)  # FNumber
+                if not info.get("focal_length"):
+                    info["focal_length"] = exif_ifd.get(0x920A)  # FocalLength
+        except Exception:
+            pass
+
+    # GPS 信息：优先从 get_ifd() 获取（兼容 HEIC），再降级到旧方式
     lat = lon = None
-    if isinstance(gps_info, dict):
-        # GPSInfo 的 key 可能是数字，需要映射
-        gps_tags = {}
-        for k, v in gps_info.items():
-            name = ExifTags.GPSTAGS.get(k, k)
-            gps_tags[name] = v
 
-        lat_ref = gps_tags.get("GPSLatitudeRef")
-        lat_raw = gps_tags.get("GPSLatitude")
-        lon_ref = gps_tags.get("GPSLongitudeRef")
-        lon_raw = gps_tags.get("GPSLongitude")
+    # 方式 1：通过 get_ifd(GPSInfo) 获取（推荐，HEIC/JPEG 通用）
+    try:
+        gps_ifd = exif_obj.get_ifd(ExifTags.IFD.GPSInfo)
+        if gps_ifd:
+            gps_tags = {}
+            for k, v in gps_ifd.items():
+                name = ExifTags.GPSTAGS.get(k, k)
+                gps_tags[name] = v
 
-        if lat_raw and lat_ref:
-            lat = _convert_gps_to_deg(lat_raw)
-            if lat is not None and lat_ref in ["S", "s"]:
-                lat = -lat
-        if lon_raw and lon_ref:
-            lon = _convert_gps_to_deg(lon_raw)
-            if lon is not None and lon_ref in ["W", "w"]:
-                lon = -lon
+            lat_ref = gps_tags.get("GPSLatitudeRef")
+            lat_raw = gps_tags.get("GPSLatitude")
+            lon_ref = gps_tags.get("GPSLongitudeRef")
+            lon_raw = gps_tags.get("GPSLongitude")
+
+            if lat_raw and lat_ref:
+                lat = _convert_gps_to_deg(lat_raw)
+                if lat is not None and lat_ref in ["S", "s"]:
+                    lat = -lat
+            if lon_raw and lon_ref:
+                lon = _convert_gps_to_deg(lon_raw)
+                if lon is not None and lon_ref in ["W", "w"]:
+                    lon = -lon
+    except Exception:
+        pass
+
+    # 方式 2：降级到旧的 GPSInfo dict（某些 JPEG 可能走这条路径）
+    if lat is None or lon is None:
+        gps_info = exif.get("GPSInfo")
+        if isinstance(gps_info, dict):
+            gps_tags = {}
+            for k, v in gps_info.items():
+                name = ExifTags.GPSTAGS.get(k, k)
+                gps_tags[name] = v
+
+            lat_ref = gps_tags.get("GPSLatitudeRef")
+            lat_raw = gps_tags.get("GPSLatitude")
+            lon_ref = gps_tags.get("GPSLongitudeRef")
+            lon_raw = gps_tags.get("GPSLongitude")
+
+            if lat_raw and lat_ref:
+                lat = _convert_gps_to_deg(lat_raw)
+                if lat is not None and lat_ref in ["S", "s"]:
+                    lat = -lat
+            if lon_raw and lon_ref:
+                lon = _convert_gps_to_deg(lon_raw)
+                if lon is not None and lon_ref in ["W", "w"]:
+                    lon = -lon
 
     info["gps_lat"] = lat
     info["gps_lon"] = lon
@@ -685,6 +761,96 @@ def get_city_resolver():
     return resolve
 
 
+
+# =======================
+# 渠道负载均衡：遇错自动切换
+# =======================
+def _post_with_channel_fallback(
+    payload_builder,
+    timeout: float = TIMEOUT,
+    response_parser=None,
+) -> requests.Response | tuple:
+    """依次尝试各渠道发送请求，遇到错误自动切换到下一个渠道。
+
+    Args:
+        payload_builder: callable(channel_dict) -> (url, headers, json_body)
+        timeout: 请求超时秒数
+        response_parser: 可选，callable(response) -> parsed_result。
+            若提供，会在收到 2xx 后调用；若解析抛异常则视为失败并切换渠道。
+            若未提供，直接返回 response 对象。
+    Returns:
+        response_parser 未提供时返回 requests.Response；
+        提供时返回 response_parser 的返回值。
+    Raises:
+        RuntimeError: 所有渠道均请求失败
+    """
+    global _channel_index
+    n = len(API_CHANNELS)
+    if n == 0:
+        raise RuntimeError("未配置任何 VLM 渠道（API_CHANNELS 为空）")
+
+    with _channel_lock:
+        start = _channel_index % n
+    last_error: str | None = None
+
+    for i in range(n):
+        idx = (start + i) % n
+        ch = API_CHANNELS[idx]
+        url, headers, body = payload_builder(ch)
+        ch_label = ch.get("model_name", url)
+
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except Exception as e:
+            print(f"[WARN] 渠道 {ch_label} 请求异常：{e}，尝试下一个渠道")
+            last_error = str(e)
+            continue
+
+        if not resp.ok:
+            print(f"[WARN] 渠道 {ch_label} 返回 HTTP {resp.status_code}，切换到下一个渠道")
+            last_error = f"HTTP {resp.status_code}"
+            if DEBUG:
+                try:
+                    _body_str = json.dumps(body, ensure_ascii=False)
+                    # base64 内容太长，截断后打印
+                    import re as _re
+                    _body_debug = _re.sub(
+                        r'("data:[^;]+;base64,)([A-Za-z0-9+/=]{200})[A-Za-z0-9+/=]+',
+                        r'\1\2…<truncated>',
+                        _body_str,
+                    )
+                    print(f"[DEBUG] 请求体（base64 已截断）:\n{_body_debug}")
+                except Exception:
+                    pass
+                try:
+                    print(f"[DEBUG] 响应体:\n{resp.text}")
+                except Exception:
+                    pass
+            continue
+
+        # 2xx 成功，如果有 parser 则尝试解析
+        if response_parser is not None:
+            try:
+                parsed = response_parser(resp)
+            except Exception as e:
+                print(f"[WARN] 渠道 {ch_label} 响应解析失败：{e}，切换到下一个渠道")
+                last_error = str(e)
+                continue
+            with _channel_lock:
+                _channel_index = 0
+            return parsed
+
+        # 无 parser，直接返回 response
+        with _channel_lock:
+            _channel_index = 0
+        return resp
+
+    # 所有渠道都失败了
+    raise RuntimeError(
+        f"所有 {n} 个渠道均请求失败（最后错误：{last_error}），请检查渠道配置"
+    )
+
+
 def call_vlm(image_path: Path) -> dict:
     try:
         img_b64 = encode_image_to_b64(image_path)
@@ -747,59 +913,236 @@ def call_vlm(image_path: Path) -> dict:
         "下面是照片的内容，请结合图像本身完成上述任务。\n"
     )
 
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
+    def _build(ch):
+        headers = {"Content-Type": "application/json"}
+        key = ch.get("api_key", "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        body = {
+            "model": ch["model_name"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}"
+                            },
                         },
-                    },
-                ],
-            },
-        ],
-        "temperature": 0.2,
-        "stream": False,
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "stream": False,
+        }
+        return ch["api_url"], headers, body
+
+    def _parse_vlm_response(resp):
+        """解析 VLM 响应，失败时抛异常以触发渠道切换。"""
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        obj = json.loads(content)
+        return obj
+
+    result = _post_with_channel_fallback(_build, timeout=TIMEOUT, response_parser=_parse_vlm_response)
+
+    return result, exif_info
+
+
+def _process_one_photo(path: Path, city_resolver) -> dict | None:
+    """处理单张照片：调用 VLM + 生成文案 + 提取 EXIF。
+
+    成功返回包含所有数据库字段的 dict，失败返回 None。
+    此函数仅做计算 + 网络 IO（不写数据库），线程安全。
+    """
+    t_photo_start = time.perf_counter()
+    try:
+        result, exif_info = call_vlm(path)
+    except Exception as e:
+        print(f"[WARN] 调用模型失败: {e}")
+        return None
+
+    caption = str(result.get("caption", "")).strip()
+    ptype = str(result.get("type", "")).strip()
+    try:
+        memory_score = float(result.get("memory_score", 0.0))
+    except Exception:
+        memory_score = 0.0
+    try:
+        beauty_score = float(result.get("beauty_score", 0.0))
+    except Exception:
+        beauty_score = 0.0
+    reason = str(result.get("reason", "")).strip()
+
+    side_caption = generate_side_caption(path)
+
+    width = exif_info.get("width")
+    height = exif_info.get("height")
+    orientation = exif_info.get("orientation")
+
+    exif_datetime = exif_info.get("datetime")
+    exif_make = exif_info.get("make")
+    exif_model_val = exif_info.get("model")
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _to_float(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    exif_iso = _to_int(exif_info.get("iso"))
+    exif_exposure_time = _to_float(exif_info.get("exposure_time"))
+    exif_f_number = _to_float(exif_info.get("f_number"))
+    exif_focal_length = _to_float(exif_info.get("focal_length"))
+    exif_gps_lat = _to_float(exif_info.get("gps_lat"))
+    exif_gps_lon = _to_float(exif_info.get("gps_lon"))
+    exif_gps_alt = _to_float(exif_info.get("gps_alt"))
+
+    if exif_gps_lat is not None and exif_gps_lon is not None:
+        exif_city = city_resolver(exif_gps_lat, exif_gps_lon)
+    else:
+        exif_city = ""
+
+    lat = exif_info.get("gps_lat")
+    lon = exif_info.get("gps_lon")
+    if lat is not None and lon is not None and not in_home(lat, lon):
+        memory_score = min(memory_score + 5.0, 100.0)
+
+    t_photo_end = time.perf_counter()
+
+    return {
+        "path": str(path),
+        "caption": caption,
+        "type": ptype,
+        "memory_score": memory_score,
+        "beauty_score": beauty_score,
+        "reason": reason,
+        "width": width,
+        "height": height,
+        "orientation": orientation,
+        "exif_json": json.dumps(exif_info, ensure_ascii=False, default=str),
+        "raw_json": json.dumps(result, ensure_ascii=False),
+        "exif_datetime": exif_datetime,
+        "exif_make": exif_make,
+        "exif_model": exif_model_val,
+        "exif_iso": exif_iso,
+        "exif_exposure_time": exif_exposure_time,
+        "exif_f_number": exif_f_number,
+        "exif_focal_length": exif_focal_length,
+        "exif_gps_lat": exif_gps_lat,
+        "exif_gps_lon": exif_gps_lon,
+        "exif_gps_alt": exif_gps_alt,
+        "side_caption": side_caption,
+        "exif_city": exif_city,
+        "cost": t_photo_end - t_photo_start,
     }
 
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT)
-    if not resp.ok:
-        print("HTTP:", resp.status_code)
-        print(resp.text)
-        raise RuntimeError(f"LM Studio 请求失败: HTTP {resp.status_code}")
 
-    data = resp.json()
-    try:
-        content = data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        print("[DEBUG] 返回内容：", data)
-        raise RuntimeError("解析失败：无法从 choices[0].message.content 读取内容")
+def _save_result_to_db(cur, conn, rec: dict):
+    """将一条处理结果写入数据库。"""
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO photo_scores
+        (path, caption, type, memory_score, beauty_score, reason,
+         width, height, orientation, used_at,
+         exif_json, raw_json,
+         exif_datetime, exif_make, exif_model,
+         exif_iso, exif_exposure_time, exif_f_number, exif_focal_length,
+         exif_gps_lat, exif_gps_lon, exif_gps_alt, side_caption, exif_city)
+        VALUES (?, ?, ?, ?, ?, ?,
+                ?, ?, ?, COALESCE((SELECT used_at FROM photo_scores WHERE path = ?), NULL),
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?)
+        """,
+        (
+            rec["path"],
+            rec["caption"],
+            rec["type"],
+            rec["memory_score"],
+            rec["beauty_score"],
+            rec["reason"],
+            rec["width"],
+            rec["height"],
+            rec["orientation"],
+            rec["path"],
+            rec["exif_json"],
+            rec["raw_json"],
+            rec["exif_datetime"],
+            rec["exif_make"],
+            rec["exif_model"],
+            rec["exif_iso"],
+            rec["exif_exposure_time"],
+            rec["exif_f_number"],
+            rec["exif_focal_length"],
+            rec["exif_gps_lat"],
+            rec["exif_gps_lon"],
+            rec["exif_gps_alt"],
+            rec["side_caption"],
+            rec["exif_city"],
+        ),
+    )
+    conn.commit()
 
-    # content 应该是 JSON 字符串
-    try:
-        obj = json.loads(content)
-    except Exception:
-        print("[DEBUG] 非 JSON 输出：", content)
-        raise RuntimeError("解析失败：模型未按 JSON 输出")
 
-    return obj, exif_info
+def _print_result(rec: dict):
+    """打印单张照片处理结果摘要。"""
+    print(f"  类型    ：{rec['type']}")
+    print(f"  回忆分  ：{rec['memory_score']:.1f}")
+    print(f"  美观分  ：{rec['beauty_score']:.1f}")
+    if rec["side_caption"]:
+        print(f"  一句话文案：{rec['side_caption']}")
+    else:
+        print("  一句话文案：(无)")
+    print(f"  画面描述：{rec['caption']}")
+    print(f"  理由    ：{rec['reason']}")
 
 
 def main():
-    filelist_path = ROOT_DIR / "filelist.txt"
+    import argparse
+    parser = argparse.ArgumentParser(description="分析照片并生成评分")
+    parser.add_argument("--cache", action="store_true",
+                        help="启用文件列表缓存：首次扫描后写入缓存，后续直接读取")
+    parser.add_argument("-j", "--concurrency", type=int, default=1,
+                        help="并发处理线程数（默认 1，即串行处理）")
+    parser.add_argument("--debug", action="store_true",
+                        help="调试模式：请求失败时打印请求体和响应体")
+    args = parser.parse_args()
 
-    print("[INFO] 正在扫描图片目录……")
-    imgs = list_images()
+    global DEBUG
+    DEBUG = args.debug
+    if DEBUG:
+        print("[INFO] 调试模式已启用")
+
+    concurrency = max(1, args.concurrency)
+    if concurrency > 1:
+        print(f"[INFO] 并发模式：{concurrency} 个工作线程")
+
+    filelist_path = ROOT_DIR / "filelist.txt"
+    cache_path = ROOT_DIR / ".filelist_cache.txt"
+
+    if args.cache and cache_path.exists():
+        print(f"[INFO] 读取缓存文件列表：{cache_path}")
+        cached = cache_path.read_text(encoding="utf-8").strip().splitlines()
+        imgs = [Path(p) for p in cached if p.strip()]
+        print(f"[INFO] 从缓存加载 {len(imgs)} 个文件。")
+    else:
+        print("[INFO] 正在扫描图片目录……")
+        imgs = list_images()
+        if args.cache:
+            cache_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
+            print(f"[INFO] 已写入缓存文件：{cache_path}")
+
     filelist_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
     print(f"[INFO] 已更新文件列表 filelist.txt，共 {len(imgs)} 个文件。")
     if not imgs:
@@ -809,7 +1152,7 @@ def main():
     if not imgs:
         raise SystemExit("[INFO] 所有图片都被 Screenshot 过滤规则排除了，没有可处理的图片。")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     ensure_table(conn)
     city_resolver = get_city_resolver()
 
@@ -897,161 +1240,90 @@ def main():
     print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
 
     cur = conn.cursor()
+    db_lock = threading.Lock()   # 保护 SQLite 写入操作
     start_time = time.time()
 
-    for idx, path in enumerate(target_paths, start=1):
-        t_photo_start = time.perf_counter()
-        sep = "=" * 60
-        print("\n" + sep)
-        print(f"[{idx}/{len(target_paths)}] 处理: {path}")
-        try:
-            result, exif_info = call_vlm(path)
-        except Exception as e:
-            print(f"[WARN] 调用模型失败: {e}")
-            continue
-        t_after_vlm = time.perf_counter()
-        vlm_cost = t_after_vlm - t_photo_start
+    if concurrency <= 1:
+        # ==================== 串行模式（原有逻辑）====================
+        for idx, path in enumerate(target_paths, start=1):
+            t_photo_start = time.perf_counter()
+            sep = "=" * 60
+            print("\n" + sep)
+            print(f"[{idx}/{len(target_paths)}] 处理: {path}")
 
-        caption = str(result.get("caption", "")).strip()
-        ptype = str(result.get("type", "")).strip()
-        try:
-            memory_score = float(result.get("memory_score", 0.0))
-        except Exception:
-            memory_score = 0.0
-        try:
-            beauty_score = float(result.get("beauty_score", 0.0))
-        except Exception:
-            beauty_score = 0.0
-        reason = str(result.get("reason", "")).strip()
+            rec = _process_one_photo(path, city_resolver)
+            if rec is None:
+                continue
 
-        side_caption = generate_side_caption(path)
-        t_after_side = time.perf_counter()
-        side_cost = t_after_side - t_after_vlm
+            _print_result(rec)
+            _save_result_to_db(cur, conn, rec)
 
-        width = exif_info.get("width")
-        height = exif_info.get("height")
-        orientation = exif_info.get("orientation")
+            t_photo_end = time.perf_counter()
+            total_cost = t_photo_end - t_photo_start
 
-        exif_datetime = exif_info.get("datetime")
-        exif_make = exif_info.get("make")
-        exif_model = exif_info.get("model")
+            processed_now = already_done + idx
+            denom = total if total > 0 else 1
+            progress = max(0.0, min(1.0, processed_now / denom))
 
-        def _to_int(v):
-            try:
-                if v is None:
-                    return None
-                return int(v)
-            except Exception:
-                return None
+            bar_width = 30
+            filled = int(bar_width * progress)
+            bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
 
-        def _to_float(v):
-            try:
-                if v is None:
-                    return None
-                return float(v)
-            except Exception:
-                return None
+            elapsed = time.time() - start_time
+            avg_per = elapsed / idx if idx > 0 else 0
+            remaining = max(total - processed_now, 0)
+            eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
-        exif_iso = _to_int(exif_info.get("iso"))
-        exif_exposure_time = _to_float(exif_info.get("exposure_time"))
-        exif_f_number = _to_float(exif_info.get("f_number"))
-        exif_focal_length = _to_float(exif_info.get("focal_length"))
-        exif_gps_lat = _to_float(exif_info.get("gps_lat"))
-        exif_gps_lon = _to_float(exif_info.get("gps_lon"))
-        exif_gps_alt = _to_float(exif_info.get("gps_alt"))
+            print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+    else:
+        # ==================== 并发模式 ====================
+        print_lock = threading.Lock()
+        completed_count = 0
+        completed_lock = threading.Lock()
 
-        if exif_gps_lat is not None and exif_gps_lon is not None:
-            exif_city = city_resolver(exif_gps_lat, exif_gps_lon)
-        else:
-            exif_city = ""
+        def _worker(idx: int, path: Path) -> tuple[int, Path, dict | None]:
+            return idx, path, _process_one_photo(path, city_resolver)
 
-        # 如果有 GPS 信息且不在本地范围内，略微提高回忆分（最多 +5，且不超过 100 分）
-        lat = exif_info.get("gps_lat")
-        lon = exif_info.get("gps_lon")
-        if lat is not None and lon is not None and not in_home(lat, lon):
-            memory_score = min(memory_score + 5.0, 100.0)
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(_worker, idx, path): (idx, path)
+                for idx, path in enumerate(target_paths, start=1)
+            }
 
-        exif_json = json.dumps(exif_info, ensure_ascii=False, default=str)
+            for future in as_completed(futures):
+                idx, path, rec = future.result()
 
-        print(f"  类型    ：{ptype}")
-        print(f"  回忆分  ：{memory_score:.1f}")
-        print(f"  美观分  ：{beauty_score:.1f}")
-        if side_caption:
-            print(f"  一句话文案：{side_caption}")
-        else:
-            print("  一句话文案：(无)")
-        print(f"  画面描述：{caption}")
-        print(f"  理由    ：{reason}")
+                with completed_lock:
+                    completed_count += 1
+                    done_so_far = completed_count
 
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO photo_scores
-            (path, caption, type, memory_score, beauty_score, reason,
-             width, height, orientation, used_at,
-             exif_json, raw_json,
-             exif_datetime, exif_make, exif_model,
-             exif_iso, exif_exposure_time, exif_f_number, exif_focal_length,
-             exif_gps_lat, exif_gps_lon, exif_gps_alt, side_caption, exif_city)
-            VALUES (?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, COALESCE((SELECT used_at FROM photo_scores WHERE path = ?), NULL),
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?)
-            """,
-            (
-                str(path),
-                caption,
-                ptype,
-                memory_score,
-                beauty_score,
-                reason,
-                width,
-                height,
-                orientation,
-                str(path),
-                exif_json,
-                json.dumps(result, ensure_ascii=False),
-                exif_datetime,
-                exif_make,
-                exif_model,
-                exif_iso,
-                exif_exposure_time,
-                exif_f_number,
-                exif_focal_length,
-                exif_gps_lat,
-                exif_gps_lon,
-                exif_gps_alt,
-                side_caption,
-                exif_city,
-            ),
-        )
-        conn.commit()
-        t_photo_end = time.perf_counter()
-        total_cost = t_photo_end - t_photo_start
-        # pretty timing summary
+                with print_lock:
+                    sep = "=" * 60
+                    print("\n" + sep)
+                    print(f"[{done_so_far}/{len(target_paths)}] 完成: {path}")
 
-        # 进度条与预估时间（以本次启动时的快照为准，不受运行中新增照片影响）
-        processed_now = already_done + idx
+                    if rec is not None:
+                        _print_result(rec)
+                        with db_lock:
+                            _save_result_to_db(cur, conn, rec)
+                    else:
+                        print("  (处理失败，已跳过)")
 
-        denom = total if total > 0 else 1
-        progress = processed_now / denom
-        # 夹紧，确保不会超过 100%
-        if progress < 0:
-            progress = 0.0
-        if progress > 1:
-            progress = 1.0
+                    processed_now = already_done + done_so_far
+                    denom = total if total > 0 else 1
+                    progress = max(0.0, min(1.0, processed_now / denom))
 
-        bar_width = 30
-        filled = int(bar_width * progress)
-        bar = "█" * filled + "░" * (bar_width - filled)
+                    bar_width = 30
+                    filled = int(bar_width * progress)
+                    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
 
-        elapsed = time.time() - start_time
-        avg_per = elapsed / idx if idx > 0 else 0
-        remaining = max(total - processed_now, 0)
-        eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
+                    elapsed = time.time() - start_time
+                    avg_per = elapsed / done_so_far if done_so_far > 0 else 0
+                    remaining = max(total - processed_now, 0)
+                    eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
-        print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+                    cost_str = f"{rec['cost']:4.1f}s" if rec else "N/A"
+                    print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {cost_str}  预计剩余 {eta} ")
 
     conn.close()
     print("\n[完成] 本批次处理完成。")
