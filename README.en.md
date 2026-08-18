@@ -290,7 +290,7 @@ On startup, the device tries to read saved Wi-Fi credentials from NVS. If creden
 ## Star History
 
 <p align="center">
-  <a href="https://star-history.com/#dai-hongtao/InkTime&Timeline">
-    <img src="https://api.star-history.com/svg?repos=dai-hongtao/InkTime&type=Timeline" width="700"/>
+  <a href="https://star-history.dera.page/#dai-hongtao/InkTime&Timeline">
+    <img src="https://star-history.dera.page/svg?repos=dai-hongtao/InkTime&type=Timeline" width="700"/>
   </a>
 </p>
